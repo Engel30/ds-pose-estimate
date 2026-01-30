@@ -1,50 +1,119 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EKF Sensor Fusion per AUV
-Fonde IMU, USBL, e Depth sensor con Extended Kalman Filter
+EKF Sensor Fusion per AUV - Mare Aperto
+Fonde IMU, USBL (coordinate X,Y), e Depth sensor con Extended Kalman Filter
 
 Caratteristiche:
-- Analisi automatica matrici covarianza dai dati
+- Caricamento log unificato kalman_*.csv
 - Modello constant-velocity (più stabile per AUV)
+- Update USBL con coordinate X,Y dirette (non range-only)
 - Correzione bias IMU
-- Update USBL range-only (ignora angles)
+- Confronto con stima CSV originale
+
+Uso:
+    python ekf_sensor_fusion.py --log ../logs/Giorno1/kalman_HE9.csv
 """
 
 import os
-import glob
+import argparse
 import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 from matplotlib.collections import LineCollection
 
 # ============================================================================
 # CONFIGURAZIONE
 # ============================================================================
 
-# Coordinate riferimenti (in metri)
-BOA_COORDINATES = (2.0, 0.0)
-NORTH_MARKER_COORDINATES = (0.0, 8.0)
-POOL_RADIUS = 8.0
+# Path di default al log CSV (modifica qui per evitare argomento CLI)
+DEFAULT_LOG_PATH = "../logs/Giorno1/kalman_HE9.csv"
 
-DATA_DIR = "sensor_logs"
+# Posizione transceiver USBL (origine del sistema di riferimento)
+TRANSCEIVER_POSITION = (0.0, 0.0, 0.0)
 
 # FLAGS
 APPLY_BIAS_CORRECTION = True
 VERBOSE = True
+SHOW_CSV_ESTIMATE = True  # Toggle per mostrare stima dal CSV originale
 
 # ============================================================================
-# FUNZIONI UTILITÀ
+# DATA LOADER
 # ============================================================================
 
-def find_latest_csv(directory, prefix):
-    pattern = os.path.join(directory, f"{prefix}_*.csv")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"Nessun file trovato con pattern: {pattern}")
-    return max(files, key=os.path.getmtime)
+def load_kalman_log(filepath):
+    """
+    Carica log unificato kalman_*.csv
+    
+    Colonne attese (23):
+    0:Timestamp, 1:Roll, 2:Pitch, 3:Yaw, 4:Acc_X, 5:Acc_Y, 6:Acc_Z,
+    7:USBL_X, 8:USBL_Y, 9:Depth, 10:Est_X, 11:Est_Y, 12:Est_Z, 13:Temp,
+    14:State_6, 15:State_7, 16:State_8, 17:Gyro_X, 18:Gyro_Y, 19:Gyro_Z,
+    20:Mag_X, 21:Mag_Y, 22:Mag_Z
+    
+    Returns:
+        imu_data: DataFrame con acc, gyro, orientamento
+        usbl_data: DataFrame con fix USBL validi (X,Y != 0)
+        depth_data: DataFrame con profondità
+        csv_estimate: DataFrame con stime originali (Est_X, Est_Y, Est_Z)
+    """
+    print(f"\nCaricamento log: {filepath}")
+    
+    # Leggi CSV
+    df = pd.read_csv(filepath)
+    
+    print(f"  Righe totali: {len(df)}")
+    print(f"  Colonne: {len(df.columns)}")
+    
+    # Converti timestamp in relativo
+    t0 = df['Timestamp'].iloc[0]
+    df['timestamp_rel'] = df['Timestamp'] - t0
+    
+    # --- IMU DATA ---
+    # Converti angoli da gradi a radianti
+    imu_data = pd.DataFrame({
+        'timestamp_rel': df['timestamp_rel'],
+        'roll': np.deg2rad(df['Roll']),
+        'pitch': np.deg2rad(df['Pitch']),
+        'yaw': np.deg2rad(df['Yaw']),
+        'acc_x': df['Acc_X'],
+        'acc_y': df['Acc_Y'],
+        'acc_z': df['Acc_Z'],
+        'gyr_x': df['Gyro_X'].fillna(0),  # Prima riga potrebbe avere NaN
+        'gyr_y': df['Gyro_Y'].fillna(0),
+        'gyr_z': df['Gyro_Z'].fillna(0),
+        'mag_x': df['Mag_X'].fillna(0),
+        'mag_y': df['Mag_Y'].fillna(0),
+        'mag_z': df['Mag_Z'].fillna(0)
+    })
+    
+    # --- USBL DATA ---
+    # Filtra solo righe con fix valido (X,Y != 0)
+    usbl_mask = (df['USBL_X'] != 0) | (df['USBL_Y'] != 0)
+    usbl_data = pd.DataFrame({
+        'timestamp_rel': df.loc[usbl_mask, 'timestamp_rel'],
+        'usbl_x': df.loc[usbl_mask, 'USBL_X'],
+        'usbl_y': df.loc[usbl_mask, 'USBL_Y']
+    }).reset_index(drop=True)
+    
+    print(f"  Fix USBL validi: {len(usbl_data)} / {len(df)}")
+    
+    # --- DEPTH DATA ---
+    depth_data = pd.DataFrame({
+        'timestamp_rel': df['timestamp_rel'],
+        'depth': df['Depth']
+    })
+    
+    # --- CSV ESTIMATE (per confronto) ---
+    csv_estimate = pd.DataFrame({
+        'timestamp_rel': df['timestamp_rel'],
+        'est_x': df['Est_X'],
+        'est_y': df['Est_Y'],
+        'est_z': df['Est_Z']
+    })
+    
+    return imu_data, usbl_data, depth_data, csv_estimate
 
 # ============================================================================
 # ANALISI AUTOMATICA COVARIANZE
@@ -53,14 +122,6 @@ def find_latest_csv(directory, prefix):
 def analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration=None):
     """
     Analizza i dati dei sensori per stimare le matrici di covarianza
-    
-    Args:
-        imu_data: DataFrame con dati IMU
-        usbl_data: DataFrame con dati USBL
-        depth_data: DataFrame con dati depth
-        imu_calibration: dict con calibrazione statica IMU (opzionale)
-                        {'bias_acc': [x,y,z], 'var_acc': [x,y,z], 
-                         'bias_gyr': [x,y,z], 'var_gyr': [x,y,z]}
     """
     print("\n" + "="*70)
     print("ANALISI RUMORE SENSORI")
@@ -68,7 +129,6 @@ def analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration=None):
     
     # --- IMU ---
     if imu_calibration is not None:
-        # Usa calibrazione statica precalcolata
         print("\n✓ Usando calibrazione statica IMU")
         bias_acc = np.array(imu_calibration['bias_acc'])
         bias_gyr = np.array(imu_calibration['bias_gyr'])
@@ -81,7 +141,6 @@ def analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration=None):
         print(f"  Bias giroscopio:    [{bias_gyr[0]:.6f}, {bias_gyr[1]:.6f}, {bias_gyr[2]:.6f}] rad/s")
         print(f"  Std giroscopio:     [{np.sqrt(var_gyr[0]):.6f}, {np.sqrt(var_gyr[1]):.6f}, {np.sqrt(var_gyr[2]):.6f}] rad/s")
     else:
-        # Fallback: stima dai dati in movimento (IMPRECISO)
         print("\n⚠ ATTENZIONE: Stimando bias/noise da dati in movimento")
         print("  Questo NON è corretto! Usa calibrazione statica.")
         
@@ -105,30 +164,39 @@ def analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration=None):
         print(f"  Std giroscopio:     [{np.sqrt(var_gyr[0]):.4f}, {np.sqrt(var_gyr[1]):.4f}, {np.sqrt(var_gyr[2]):.4f}] rad/s")
     
     # --- USBL ---
-    usbl_range = usbl_data['range'].values
-    var_usbl = np.var(usbl_range)
+    # Stima varianza dalle coordinate X,Y
+    usbl_x = usbl_data['usbl_x'].values
+    usbl_y = usbl_data['usbl_y'].values
+    
+    # Usa varianza differenziale (più robusta)
+    if len(usbl_x) > 1:
+        var_usbl_x = np.var(np.diff(usbl_x)) / 2  # Varianza differenze / 2
+        var_usbl_y = np.var(np.diff(usbl_y)) / 2
+    else:
+        var_usbl_x = 1.0  # Default
+        var_usbl_y = 1.0
     
     print(f"\nUSBL:")
-    print(f"  Range medio: {np.mean(usbl_range):.3f} m")
-    print(f"  Std range:   {np.sqrt(var_usbl):.3f} m")
+    print(f"  Fix validi: {len(usbl_data)}")
+    print(f"  X range: [{usbl_x.min():.2f}, {usbl_x.max():.2f}] m")
+    print(f"  Y range: [{usbl_y.min():.2f}, {usbl_y.max():.2f}] m")
+    print(f"  Std X: {np.sqrt(var_usbl_x):.3f} m")
+    print(f"  Std Y: {np.sqrt(var_usbl_y):.3f} m")
     
     # --- DEPTH ---
-    if 'depth' in depth_data.columns:
-        depth = depth_data['depth'].values
-        var_depth = np.var(depth)
-        print(f"\nDepth:")
-        print(f"  Profondità media: {np.mean(depth):.3f} m")
-        print(f"  Std depth:        {np.sqrt(var_depth):.4f} m")
-    else:
-        var_depth = 0.01  # Default
-        print(f"\nDepth: usando varianza default {var_depth}")
+    depth = depth_data['depth'].values
+    var_depth = np.var(np.diff(depth)) / 2 if len(depth) > 1 else 0.01
+    print(f"\nDepth:")
+    print(f"  Range: [{depth.min():.3f}, {depth.max():.3f}] m")
+    print(f"  Std depth: {np.sqrt(var_depth):.4f} m")
     
     return {
         'bias_acc': bias_acc,
         'bias_gyr': bias_gyr,
         'var_acc': var_acc,
         'var_gyr': var_gyr,
-        'var_usbl': var_usbl,
+        'var_usbl_x': var_usbl_x,
+        'var_usbl_y': var_usbl_y,
         'var_depth': var_depth
     }
 
@@ -145,9 +213,10 @@ class EKF_AUV:
     - Velocità 3D
     
     Modello: Constant velocity (più stabile del constant acceleration)
+    Update USBL: Coordinate X,Y dirette (osservazione lineare)
     """
     
-    def __init__(self, sensor_noise, dt=0.02, config=None, initial_state=None, boa_position=None):
+    def __init__(self, sensor_noise, dt=0.02, config=None, initial_state=None):
         """
         Inizializza EKF
         
@@ -157,19 +226,9 @@ class EKF_AUV:
             config: dict con parametri di configurazione (opzionale)
             initial_state: dict con posizione e velocità iniziali (opzionale)
                           {'position': [x, y, z], 'velocity': [vx, vy, vz]}
-            boa_position: posizione BOA/transponder USBL [x, y, z] (opzionale)
-                         Default: [0, 0, 0] (origine)
         """
         self.dt = dt
         self.sensor_noise = sensor_noise
-        
-        # Posizione BOA (per calcolo range USBL)
-        if boa_position is None:
-            self.boa_position = np.array([0.0, 0.0, 0.0])
-        else:
-            self.boa_position = np.array(boa_position)
-            if VERBOSE:
-                print(f"\nPosizione BOA: [{boa_position[0]:.2f}, {boa_position[1]:.2f}, {boa_position[2]:.2f}] m")
         
         # Carica configurazione (usa default se non fornita)
         if config is None:
@@ -224,11 +283,14 @@ class EKF_AUV:
             q_vel, q_vel, q_vel_z
         ])
         
-        # Measurement noise R
+        # Measurement noise R per USBL (2x2 per X,Y)
         r_usbl_factor = config.get('R_USBL_FACTOR', 1.5)
         r_depth_min = config.get('R_DEPTH_MIN', 0.01)
         
-        self.R_usbl = np.array([[sensor_noise['var_usbl'] * r_usbl_factor]])  
+        self.R_usbl = np.diag([
+            sensor_noise['var_usbl_x'] * r_usbl_factor,
+            sensor_noise['var_usbl_y'] * r_usbl_factor
+        ])
         self.R_depth = np.array([[max(sensor_noise['var_depth'], r_depth_min)]])
         
         if VERBOSE:
@@ -240,17 +302,14 @@ class EKF_AUV:
             print(f"  Velocità:  {q_vel} m²/s²")
             print(f"  Velocità Z: {q_vel_z} m²/s²")
             print(f"\nMatrice R (measurement noise):")
-            print(f"  USBL range: {self.R_usbl[0,0]:.4f} m²")
-            print(f"  Depth:      {self.R_depth[0,0]:.4f} m²")
+            print(f"  USBL X: {self.R_usbl[0,0]:.4f} m²")
+            print(f"  USBL Y: {self.R_usbl[1,1]:.4f} m²")
+            print(f"  Depth:  {self.R_depth[0,0]:.4f} m²")
             print(f"\nACC integration weight: {self.acc_weight}")
         
     def predict(self, acc_body, gyro, roll, pitch, yaw):
         """
         Prediction step - integra IMU
-        
-        Per constant velocity model:
-        x_k+1 = x_k + vx_k * dt
-        vx_k+1 = vx_k + ax * dt (con poca fiducia in ax)
         
         Args:
             acc_body: accelerazione in body frame [ax, ay, az] (m/s²)
@@ -260,10 +319,6 @@ class EKF_AUV:
         # Rotazione da body frame a world frame
         R_body_to_world = self._rotation_matrix(roll, pitch, yaw)
         acc_world = R_body_to_world @ acc_body
-        
-        # Modello constant velocity con piccola correzione da accelerazione
-        # x_k+1 = x_k + v_k * dt + 0.5 * a_k * dt^2 (con peso ridotto)
-        # v_k+1 = v_k + a_k * dt (con peso ridotto)
         
         # State transition
         x_pred = self.x.copy()
@@ -278,9 +333,9 @@ class EKF_AUV:
         
         # Jacobiano della transizione
         F = np.eye(6)
-        F[0, 3] = self.dt  # dx/dvx
-        F[1, 4] = self.dt  # dy/dvy
-        F[2, 5] = self.dt  # dz/dvz
+        F[0, 3] = self.dt
+        F[1, 4] = self.dt
+        F[2, 5] = self.dt
         
         # Covarianza prediction
         P_pred = F @ self.P @ F.T + self.Q
@@ -288,54 +343,45 @@ class EKF_AUV:
         self.x = x_pred
         self.P = P_pred
         
-    def update_usbl(self, range_measured):
+    def update_usbl_position(self, x_meas, y_meas):
         """
-        Update step - correzione con range USBL
+        Update step - correzione con coordinate USBL dirette
         
-        Misura: h(x) = sqrt((x-x_boa)² + (y-y_boa)² + (z-z_boa)²)
-        Range calcolato dalla posizione della BOA
+        Misura: h(x) = [x, y] (osservazione lineare!)
         
         Args:
-            range_measured: distanza misurata dall'USBL (m)
+            x_meas: coordinata X misurata dall'USBL (m)
+            y_meas: coordinata Y misurata dall'USBL (m)
         """
-        # Calcola distanza dalla BOA
-        dx = self.x[0] - self.boa_position[0]
-        dy = self.x[1] - self.boa_position[1]
-        dz = self.x[2] - self.boa_position[2]
-        range_pred = np.sqrt(dx**2 + dy**2 + dz**2)
+        # Jacobiano: H = [[1,0,0,0,0,0], [0,1,0,0,0,0]]
+        H = np.zeros((2, 6))
+        H[0, 0] = 1.0  # ∂h1/∂x
+        H[1, 1] = 1.0  # ∂h2/∂y
         
-        # Evita divisione per zero
-        if range_pred < 1e-6:
-            range_pred = 1e-6
-        
-        # Jacobiano: H = [∂h/∂x, ∂h/∂y, ∂h/∂z, 0, 0, 0]
-        H = np.zeros((1, 6))
-        H[0, 0] = dx / range_pred  # ∂h/∂x
-        H[0, 1] = dy / range_pred  # ∂h/∂y
-        H[0, 2] = dz / range_pred  # ∂h/∂z
+        # Misura e predizione
+        z = np.array([x_meas, y_meas])
+        z_pred = self.x[0:2]
         
         # Innovation
-        y = range_measured - range_pred
+        y = z - z_pred
         
         # Innovation covariance
         S = H @ self.P @ H.T + self.R_usbl
         
         # Kalman gain
-        K = self.P @ H.T / S[0, 0]
+        K = self.P @ H.T @ np.linalg.inv(S)
         
         # State update
-        self.x = self.x + K.flatten() * y
+        self.x = self.x + K @ y
         
         # Covariance update (Joseph form per stabilità numerica)
         I = np.eye(6)
-        IKH = I - np.outer(K, H)
-        self.P = IKH @ self.P @ IKH.T + np.outer(K, K) * self.R_usbl[0, 0]
+        IKH = I - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ self.R_usbl @ K.T
         
     def update_depth(self, depth_measured):
         """
         Update step - correzione con depth sensor
-        
-        Misura: h(x) = z
         
         Args:
             depth_measured: profondità misurata (m)
@@ -344,7 +390,7 @@ class EKF_AUV:
         H = np.zeros((1, 6))
         H[0, 2] = 1.0
         
-        # Innovation
+        # Innovation (depth è positivo, z è negativo sott'acqua)
         y = depth_measured - self.x[2]
         
         # Innovation covariance
@@ -385,14 +431,9 @@ class EKF_AUV:
 # FUSIONE SENSORI
 # ============================================================================
 
-def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None, initial_state=None, boa_position=None):
+def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None, initial_state=None):
     """
     Esegue la fusione sensoriale con EKF
-    
-    Args:
-        config: dict con parametri di configurazione (opzionale)
-        initial_state: dict con stato iniziale (opzionale)
-        boa_position: posizione BOA [x, y, z] (opzionale)
     
     Returns:
         trajectory: array Nx7 [timestamp, x, y, z, vx, vy, vz]
@@ -401,13 +442,13 @@ def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None
     print("ESECUZIONE FUSIONE SENSORIALE")
     print("="*70)
     
-    # Calcola dt medio dall'IMU (sensore più veloce)
+    # Calcola dt medio dall'IMU
     dt_imu = np.diff(imu_data['timestamp_rel'].values)
     dt_mean = np.mean(dt_imu)
     print(f"\nFrequenza IMU: {1/dt_mean:.1f} Hz (dt = {dt_mean:.4f} s)")
     
-    # Inizializza EKF con config, stato iniziale e posizione BOA
-    ekf = EKF_AUV(sensor_noise, dt=dt_mean, config=config, initial_state=initial_state, boa_position=boa_position)
+    # Inizializza EKF
+    ekf = EKF_AUV(sensor_noise, dt=dt_mean, config=config, initial_state=initial_state)
     
     # Prepara dati
     time_imu = imu_data['timestamp_rel'].values
@@ -425,15 +466,12 @@ def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None
     idx_usbl = 0
     idx_depth = 0
     
-    # Ultima posizione per statistiche
-    last_usbl_update = -999.0
-    
     print(f"\nInizio fusione...")
     print(f"  Campioni IMU:   {len(imu_data)}")
     print(f"  Fix USBL:       {len(usbl_data)}")
     print(f"  Misure depth:   {len(depth_data)}")
     
-    # Loop principale - itera su campioni IMU
+    # Loop principale
     for i in range(len(imu_data)):
         t = time_imu[i]
         
@@ -459,20 +497,19 @@ def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None
         
         # Update USBL (se disponibile)
         if idx_usbl < len(usbl_data) and abs(t - time_usbl[idx_usbl]) < dt_mean:
-            range_meas = usbl_data.iloc[idx_usbl]['range']
-            ekf.update_usbl(range_meas)
-            last_usbl_update = t
+            x_meas = usbl_data.iloc[idx_usbl]['usbl_x']
+            y_meas = usbl_data.iloc[idx_usbl]['usbl_y']
+            ekf.update_usbl_position(x_meas, y_meas)
             idx_usbl += 1
             
-            if VERBOSE and idx_usbl % 5 == 0:
-                print(f"  t={t:6.2f}s: USBL update #{idx_usbl}, range={range_meas:.2f}m")
+            if VERBOSE and idx_usbl % 10 == 0:
+                print(f"  t={t:6.2f}s: USBL update #{idx_usbl}, pos=({x_meas:.2f}, {y_meas:.2f})")
         
         # Update Depth (se disponibile)
         if len(time_depth) > 0 and idx_depth < len(depth_data):
             if abs(t - time_depth[idx_depth]) < dt_mean:
-                if 'depth' in depth_data.columns:
-                    depth_meas = depth_data.iloc[idx_depth]['depth']
-                    ekf.update_depth(depth_meas)
+                depth_meas = depth_data.iloc[idx_depth]['depth']
+                ekf.update_depth(depth_meas)
                 idx_depth += 1
         
         # Salva stato
@@ -489,223 +526,223 @@ def run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config=None
     return trajectory
 
 # ============================================================================
-# MAIN
+# VISUALIZZAZIONE
 # ============================================================================
 
-if __name__ == "__main__":
-    print("="*70)
-    print("EKF SENSOR FUSION - AUV NAVIGATION")
-    print("="*70)
-    
-    # Carica configurazione
-    config = None
-    initial_state = None
-    boa_position = None
-    
-    try:
-        from ekf_config import (Q_POSITION, Q_VELOCITY, Q_VELOCITY_Z, 
-                               R_USBL_FACTOR, R_DEPTH_MIN,
-                               P0_POSITION_XY, P0_POSITION_Z, P0_VELOCITY,
-                               ACC_INTEGRATION_WEIGHT,
-                               INITIAL_POSITION, INITIAL_VELOCITY,
-                               BOA_POSITION)
-        config = {
-            'Q_POSITION': Q_POSITION,
-            'Q_VELOCITY': Q_VELOCITY,
-            'Q_VELOCITY_Z': Q_VELOCITY_Z,
-            'R_USBL_FACTOR': R_USBL_FACTOR,
-            'R_DEPTH_MIN': R_DEPTH_MIN,
-            'P0_POSITION_XY': P0_POSITION_XY,
-            'P0_POSITION_Z': P0_POSITION_Z,
-            'P0_VELOCITY': P0_VELOCITY,
-            'ACC_INTEGRATION_WEIGHT': ACC_INTEGRATION_WEIGHT
-        }
-        initial_state = {
-            'position': INITIAL_POSITION,
-            'velocity': INITIAL_VELOCITY
-        }
-        boa_position = BOA_POSITION
-        print("\n✓ Configurazione caricata da ekf_config.py")
-    except ImportError:
-        print("\n⚠ ekf_config.py non trovato, usando configurazione default")
-    
-    # Carica calibrazione IMU statica (se disponibile)
-    imu_calibration = None
-    try:
-        import json
-        with open('imu_calibration.json', 'r') as f:
-            imu_calibration = json.load(f)
-        print("✓ Calibrazione IMU statica caricata da imu_calibration.json")
-    except FileNotFoundError:
-        print("⚠ imu_calibration.json non trovato, userò stima approssimativa")
-    
-    # Carica dati
-    print("\nCaricamento dati sensori...")
-    imu_file = find_latest_csv(DATA_DIR, "imu")
-    usbl_file = find_latest_csv(DATA_DIR, "usbl")
-    depth_file = find_latest_csv(DATA_DIR, "depth")
-    
-    imu_data = pd.read_csv(imu_file)
-    usbl_data = pd.read_csv(usbl_file)
-    depth_data = pd.read_csv(depth_file)
-    
-    # Analisi rumore sensori (passa calibrazione IMU se disponibile)
-    sensor_noise = analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration)
-    
-    # Esegui fusione con config, stato iniziale e posizione BOA
-    trajectory = run_sensor_fusion(imu_data, usbl_data, depth_data, sensor_noise, config, initial_state, boa_position)
-    
-    # ========================================================================
-    # VISUALIZZAZIONE
-    # ========================================================================
-    
+def plot_results(trajectory, usbl_data, depth_data, csv_estimate, show_csv=True):
+    """
+    Visualizza risultati della fusione sensoriale
+    """
     print("\n" + "="*70)
     print("VISUALIZZAZIONE")
     print("="*70)
     
     fig = plt.figure(figsize=(18, 7))
     
+    # Estrai dati
+    time_ekf = trajectory[:, 0]
+    x_ekf = trajectory[:, 1]
+    y_ekf = trajectory[:, 2]
+    z_ekf = trajectory[:, 3]
+    vx = trajectory[:, 4]
+    vy = trajectory[:, 5]
+    
+    time_usbl = usbl_data['timestamp_rel'].values
+    usbl_x = usbl_data['usbl_x'].values
+    usbl_y = usbl_data['usbl_y'].values
+    
+    time_csv = csv_estimate['timestamp_rel'].values
+    csv_x = csv_estimate['est_x'].values
+    csv_y = csv_estimate['est_y'].values
+    csv_z = csv_estimate['est_z'].values
+    
     # --- SUBPLOT 1: Mappa 2D ---
     ax1 = fig.add_subplot(131, aspect='equal')
     
-    # Piscina
-    pool = Circle((0, 0), POOL_RADIUS, fill=False, edgecolor='blue', 
-                  linewidth=2, linestyle='--', label='Piscina (R=8m)')
-    ax1.add_patch(pool)
+    # Transceiver USBL (origine)
+    ax1.plot(0, 0, 'k^', markersize=15, label='USBL Transceiver', zorder=10)
     
-    # BOA
-    boa = Circle(BOA_COORDINATES, 0.3, color='red', alpha=0.7, label='BOA')
-    ax1.add_patch(boa)
+    # Fix USBL sparsi
+    ax1.scatter(usbl_x, usbl_y, c='cyan', s=30, alpha=0.6, 
+                edgecolors='blue', linewidths=0.5,
+                label=f'USBL Fixes ({len(usbl_data)})', zorder=3)
     
-    # Marker nord
-    ax1.plot(NORTH_MARKER_COORDINATES[0], NORTH_MARKER_COORDINATES[1], 
-             's', color='gray', markersize=12, label='Nord', zorder=5)
+    # Stima CSV originale (opzionale)
+    if show_csv and SHOW_CSV_ESTIMATE:
+        ax1.plot(csv_x, csv_y, '--', color='gray', 
+                 linewidth=1.5, alpha=0.7, label='CSV Estimate (Original)')
     
-    # Traccia EKF nuovo
-    x_new = trajectory[:, 1]
-    y_new = trajectory[:, 2]
-    time_new = trajectory[:, 0]
-    
-    points = np.array([x_new, y_new]).T.reshape(-1, 1, 2)
+    # Traccia EKF (colorata per tempo)
+    points = np.array([x_ekf, y_ekf]).T.reshape(-1, 1, 2)
     segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    norm = plt.Normalize(time_new.min(), time_new.max())
+    norm = plt.Normalize(time_ekf.min(), time_ekf.max())
     lc = LineCollection(segments, cmap='plasma', norm=norm, linewidth=2.5, 
-                       label='EKF Nuovo', zorder=4)
-    lc.set_array(time_new[:-1])
+                       label='EKF New', zorder=4)
+    lc.set_array(time_ekf[:-1])
     ax1.add_collection(lc)
     
     # Marker start/end
-    ax1.plot(x_new[0], y_new[0], 'go', markersize=12, label='Start', zorder=6)
-    ax1.plot(x_new[-1], y_new[-1], 'rs', markersize=12, label='End', zorder=6)
+    ax1.plot(x_ekf[0], y_ekf[0], 'go', markersize=12, label='Start', zorder=6)
+    ax1.plot(x_ekf[-1], y_ekf[-1], 'rs', markersize=12, label='End', zorder=6)
     
     # Colorbar
     cbar = plt.colorbar(lc, ax=ax1, label='Tempo [s]')
     
-    # Assi
-    ax1.set_xlabel('X [m]', fontsize=12)
-    ax1.set_ylabel('Y [m]', fontsize=12)
-    ax1.set_title('Traiettoria EKF (Constant Velocity)', fontsize=14, fontweight='bold')
+    # Assi auto
+    all_x = np.concatenate([x_ekf, usbl_x])
+    all_y = np.concatenate([y_ekf, usbl_y])
+    margin = max(np.ptp(all_x), np.ptp(all_y)) * 0.1 + 1
+    ax1.set_xlim(all_x.min() - margin, all_x.max() + margin)
+    ax1.set_ylim(all_y.min() - margin, all_y.max() + margin)
+    
+    ax1.set_xlabel('X [m] (Est)', fontsize=12)
+    ax1.set_ylabel('Y [m] (Nord)', fontsize=12)
+    ax1.set_title('Traiettoria EKF (XY Update)', fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='upper right', fontsize=9)
-    margin = 1.5
-    ax1.set_xlim(-POOL_RADIUS - margin, POOL_RADIUS + margin)
-    ax1.set_ylim(-POOL_RADIUS - margin, POOL_RADIUS + margin)
+    ax1.legend(loc='upper right', fontsize=8)
     ax1.axhline(y=0, color='k', linewidth=0.5, alpha=0.3)
     ax1.axvline(x=0, color='k', linewidth=0.5, alpha=0.3)
     
-    # --- SUBPLOT 2: Range USBL vs EKF ---
+    # --- SUBPLOT 2: Confronto X,Y ---
     ax2 = fig.add_subplot(132)
     
-    time_usbl = usbl_data['timestamp_rel'].values
-    usbl_range = usbl_data['range'].values
+    ax2.plot(time_usbl, usbl_x, 'o', color='steelblue', markersize=4, 
+             alpha=0.6, label='USBL X')
+    ax2.plot(time_usbl, usbl_y, 's', color='forestgreen', markersize=4, 
+             alpha=0.6, label='USBL Y')
+    ax2.plot(time_ekf, x_ekf, '-', color='blue', linewidth=1.5, 
+             alpha=0.8, label='EKF X')
+    ax2.plot(time_ekf, y_ekf, '-', color='green', linewidth=1.5, 
+             alpha=0.8, label='EKF Y')
     
-    # Range EKF (distanza dalla BOA)
-    if boa_position is not None:
-        dx = x_new - boa_position[0]
-        dy = y_new - boa_position[1]
-        dz = trajectory[:, 3] - boa_position[2]
-        range_ekf = np.sqrt(dx**2 + dy**2 + dz**2)
-    else:
-        # Fallback: distanza dall'origine
-        range_ekf = np.sqrt(x_new**2 + y_new**2 + trajectory[:, 3]**2)
-    
-    ax2.plot(time_usbl, usbl_range, 'o-', color='steelblue', 
-             markersize=8, linewidth=2, label='USBL Measured', zorder=3)
-    ax2.plot(time_new, range_ekf, '-', color='red', alpha=0.7,
-             linewidth=1.5, label='EKF Estimate', zorder=2)
+    if show_csv and SHOW_CSV_ESTIMATE:
+        ax2.plot(time_csv, csv_x, '--', color='lightblue', linewidth=1, 
+                 alpha=0.5, label='CSV X')
+        ax2.plot(time_csv, csv_y, '--', color='lightgreen', linewidth=1, 
+                 alpha=0.5, label='CSV Y')
     
     ax2.set_xlabel('Tempo [s]', fontsize=12)
-    ax2.set_ylabel('Range [m]', fontsize=12)
-    ax2.set_title('Confronto Range USBL', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Posizione [m]', fontsize=12)
+    ax2.set_title('Confronto Coordinate X,Y', fontsize=14, fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend()
+    ax2.legend(loc='best', fontsize=8)
     
-    # Statistiche
-    mean_range = np.mean(usbl_range)
-    ax2.axhline(y=mean_range, color='blue', linestyle='--', 
-                alpha=0.3, linewidth=1)
-    
-    # --- SUBPLOT 3: Velocità ---
+    # --- SUBPLOT 3: Profondità + Velocità ---
     ax3 = fig.add_subplot(133)
     
-    vx = trajectory[:, 4]
-    vy = trajectory[:, 5]
-    speed_2d = np.sqrt(vx**2 + vy**2)
+    # Profondità
+    depth = depth_data['depth'].values
+    time_depth = depth_data['timestamp_rel'].values
+    ax3.plot(time_depth, depth, 'c-', linewidth=1, alpha=0.5, label='Depth Sensor')
+    ax3.plot(time_ekf, z_ekf, 'b-', linewidth=1.5, label='EKF Z')
     
-    ax3.plot(time_new, vx, label='VX', alpha=0.7, linewidth=1.5)
-    ax3.plot(time_new, vy, label='VY', alpha=0.7, linewidth=1.5)
-    ax3.plot(time_new, speed_2d, 'k-', label='Speed 2D', linewidth=2)
-    ax3.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=0.5)
+    if show_csv and SHOW_CSV_ESTIMATE:
+        ax3.plot(time_csv, csv_z, '--', color='gray', linewidth=1, 
+                 alpha=0.5, label='CSV Z')
     
     ax3.set_xlabel('Tempo [s]', fontsize=12)
-    ax3.set_ylabel('Velocità [m/s]', fontsize=12)
-    ax3.set_title('Velocità Stimata EKF', fontsize=14, fontweight='bold')
+    ax3.set_ylabel('Profondità [m]', fontsize=12)
+    ax3.set_title('Profondità', fontsize=14, fontweight='bold')
     ax3.grid(True, alpha=0.3)
-    ax3.legend()
+    ax3.legend(loc='best', fontsize=8)
+    ax3.invert_yaxis()  # Profondità cresce verso il basso
     
     plt.tight_layout()
     
     # Statistiche finali
     print(f"\n=== STATISTICHE FINALI ===")
     print(f"\nTraiettoria EKF:")
-    print(f"  Durata: {time_new[-1] - time_new[0]:.2f} s")
+    print(f"  Durata: {time_ekf[-1] - time_ekf[0]:.2f} s")
     
-    # Distanza percorsa
-    dist = np.sum(np.sqrt(np.diff(x_new)**2 + np.diff(y_new)**2))
+    dist = np.sum(np.sqrt(np.diff(x_ekf)**2 + np.diff(y_ekf)**2))
     print(f"  Distanza percorsa: {dist:.2f} m")
-    print(f"  Posizione iniziale: ({x_new[0]:.3f}, {y_new[0]:.3f}, {trajectory[0,3]:.3f}) m")
-    print(f"  Posizione finale:   ({x_new[-1]:.3f}, {y_new[-1]:.3f}, {trajectory[-1,3]:.3f}) m")
+    print(f"  Posizione iniziale: ({x_ekf[0]:.3f}, {y_ekf[0]:.3f}, {z_ekf[0]:.3f}) m")
+    print(f"  Posizione finale:   ({x_ekf[-1]:.3f}, {y_ekf[-1]:.3f}, {z_ekf[-1]:.3f}) m")
     
-    # Velocità
+    speed_2d = np.sqrt(vx**2 + vy**2)
     print(f"\nVelocità:")
     print(f"  Media 2D: {np.mean(speed_2d):.3f} m/s")
     print(f"  Max 2D:   {np.max(speed_2d):.3f} m/s")
     
-    # Errore range USBL
-    range_errors = []
+    # Errore vs USBL
+    usbl_errors = []
     for i, t_usbl in enumerate(time_usbl):
-        idx = np.argmin(np.abs(time_new - t_usbl))
-        
-        # Calcola range dalla BOA
-        if boa_position is not None:
-            dx = x_new[idx] - boa_position[0]
-            dy = y_new[idx] - boa_position[1]
-            dz = trajectory[idx,3] - boa_position[2]
-            range_ekf_at_usbl = np.sqrt(dx**2 + dy**2 + dz**2)
-        else:
-            # Fallback: distanza dall'origine
-            range_ekf_at_usbl = np.sqrt(x_new[idx]**2 + y_new[idx]**2 + trajectory[idx,3]**2)
-        
-        error = abs(range_ekf_at_usbl - usbl_range[i])
-        range_errors.append(error)
+        idx = np.argmin(np.abs(time_ekf - t_usbl))
+        error = np.sqrt((x_ekf[idx] - usbl_x[i])**2 + (y_ekf[idx] - usbl_y[i])**2)
+        usbl_errors.append(error)
     
-    range_errors = np.array(range_errors)
-    print(f"\nErrore range USBL:")
-    print(f"  Media: {np.mean(range_errors):.3f} m")
-    print(f"  RMS:   {np.sqrt(np.mean(range_errors**2)):.3f} m")
-    print(f"  Max:   {np.max(range_errors):.3f} m")
+    usbl_errors = np.array(usbl_errors)
+    print(f"\nErrore vs USBL:")
+    print(f"  Media: {np.mean(usbl_errors):.3f} m")
+    print(f"  RMS:   {np.sqrt(np.mean(usbl_errors**2)):.3f} m")
+    print(f"  Max:   {np.max(usbl_errors):.3f} m")
+    
+    # Errore vs CSV estimate
+    if show_csv and SHOW_CSV_ESTIMATE:
+        csv_errors = np.sqrt((x_ekf - csv_x)**2 + (y_ekf - csv_y)**2)
+        print(f"\nErrore vs CSV Estimate:")
+        print(f"  Media: {np.mean(csv_errors):.3f} m")
+        print(f"  RMS:   {np.sqrt(np.mean(csv_errors**2)):.3f} m")
     
     plt.savefig('ekf_fusion_result.png', dpi=150, bbox_inches='tight')
     print(f"\nGrafico salvato: ekf_fusion_result.png")
+    
+    return fig
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='EKF Sensor Fusion per AUV')
+    parser.add_argument('--log', type=str, default=DEFAULT_LOG_PATH,
+                        help=f'Path al file kalman_*.csv (default: {DEFAULT_LOG_PATH})')
+    parser.add_argument('--no-csv-estimate', action='store_true',
+                        help='Non mostrare stima CSV originale')
+    parser.add_argument('--calibration', type=str, default=None,
+                        help='Path a imu_calibration.json')
+    args = parser.parse_args()
+    
+    # Override globale
+    if args.no_csv_estimate:
+        SHOW_CSV_ESTIMATE = False
+    
+    print("="*70)
+    print("EKF SENSOR FUSION - AUV NAVIGATION (Mare Aperto)")
+    print("="*70)
+    
+    # Carica calibrazione IMU statica (se disponibile)
+    imu_calibration = None
+    if args.calibration:
+        try:
+            with open(args.calibration, 'r') as f:
+                imu_calibration = json.load(f)
+            print(f"✓ Calibrazione IMU caricata da {args.calibration}")
+        except FileNotFoundError:
+            print(f"⚠ {args.calibration} non trovato")
+    
+    # Carica dati dal log unificato
+    imu_data, usbl_data, depth_data, csv_estimate = load_kalman_log(args.log)
+    
+    # Analisi rumore sensori
+    sensor_noise = analyze_sensor_noise(imu_data, usbl_data, depth_data, imu_calibration)
+    
+    # Stato iniziale dal primo fix USBL
+    initial_state = None
+    if len(usbl_data) > 0:
+        initial_state = {
+            'position': [usbl_data.iloc[0]['usbl_x'], 
+                        usbl_data.iloc[0]['usbl_y'], 
+                        depth_data.iloc[0]['depth']],
+            'velocity': [0.0, 0.0, 0.0]
+        }
+    
+    # Esegui fusione
+    trajectory = run_sensor_fusion(imu_data, usbl_data, depth_data, 
+                                   sensor_noise, initial_state=initial_state)
+    
+    # Visualizza
+    fig = plot_results(trajectory, usbl_data, depth_data, csv_estimate, 
+                       show_csv=SHOW_CSV_ESTIMATE)
     
     plt.show()
