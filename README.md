@@ -17,15 +17,13 @@ ds-state-estimate/
 │   ├── Giorno2/
 │   ├── Giorno3/
 │   └── sensor_plots/          # Output grafici (generato)
-│       ├── Giorno1/
-│       │   ├── kalman_HE9/    # 8 PNG per log
-│       │   └── ...
-│       └── ...
+│       └── Giorno*/kalman_*/  # 9 PNG per ogni log
 │
 ├── scripts/
-│   ├── ekf_sensor_fusion.py   # EKF sensor fusion
-│   ├── analyze_sensors.py     # Generazione grafici singolo log
-│   └── batch_analyze.py       # Batch processing tutti i log
+│   ├── ekf_sensor_fusion.py   # EKF interattivo (singolo log)
+│   ├── analyze_sensors.py     # Grafici sensori (singolo log)
+│   ├── batch_analyze.py       # Batch grafici sensori (tutti i log)
+│   └── batch_ekf.py           # Batch EKF comparison (tutti i log)
 │
 └── old-code/                  # Codice legacy
 ```
@@ -37,83 +35,66 @@ ds-state-estimate/
 ```bash
 cd scripts
 
-# Batch: genera grafici per TUTTI i log (14 log → 112 PNG)
-python batch_analyze.py
+# Batch: genera TUTTI i grafici per tutti i log
+python batch_analyze.py   # 8 grafici sensori per log
+python batch_ekf.py       # 1 grafico EKF comparison per log
 
-# Singolo log: analisi sensori
+# Singolo log
 python analyze_sensors.py --log ../logs/Giorno1/kalman_HE9.csv
-
-# EKF Sensor Fusion
-python ekf_sensor_fusion.py
+python ekf_sensor_fusion.py --log ../logs/Giorno1/kalman_HE9.csv
 ```
 
 ---
 
 ## Scripts
 
-### batch_analyze.py
-
-Processa tutti i `kalman_*.csv` in `logs/Giorno*` e genera grafici in struttura mirrored.
-
-```bash
-python batch_analyze.py           # Processa tutto
-python batch_analyze.py --dry-run # Preview senza eseguire
-```
-
-**Output:** `logs/sensor_plots/Giorno*/kalman_*/` (8 PNG per log)
+| Script | Descrizione |
+|--------|-------------|
+| `batch_analyze.py` | Genera grafici sensori per tutti i log |
+| `batch_ekf.py` | Esegue EKF e confronta con stima CSV per tutti i log |
+| `analyze_sensors.py` | Grafici sensori per singolo log |
+| `ekf_sensor_fusion.py` | EKF interattivo con visualizzazione |
 
 ---
 
-### analyze_sensors.py
+## 📊 Output Grafici (sensor_plots/)
 
-Genera 8 grafici PNG per un singolo log:
+Ogni cartella `sensor_plots/Giorno*/kalman_*/` contiene **9 PNG**:
 
-| Grafico | Contenuto |
-|---------|-----------|
-| `overview.png` | Panoramica tutti i sensori |
-| `orientation.png` | Roll, Pitch, Yaw |
-| `acceleration.png` | Acc X,Y,Z |
-| `gyroscope.png` | Gyro X,Y,Z |
-| `magnetometer.png` | Mag X,Y,Z |
-| `usbl.png` | Timeline + mappa USBL |
+### Grafici Sensori (da `batch_analyze.py`)
+
+| File | Contenuto |
+|------|-----------|
+| `overview.png` | Panoramica: Yaw, Depth, |Acc|, |Gyro|, USBL, Temp |
+| `orientation.png` | Roll, Pitch, Yaw nel tempo |
+| `acceleration.png` | Accelerazione X, Y, Z |
+| `gyroscope.png` | Velocità angolare X, Y, Z |
+| `magnetometer.png` | Campo magnetico X, Y, Z |
+| `usbl.png` | Timeline USBL X,Y + mappa posizioni |
 | `depth_temp.png` | Profondità + temperatura |
-| `kalman_estimate.png` | Stima KF originale |
+| `kalman_estimate.png` | Stima KF originale (dal CSV) |
 
-```bash
-python analyze_sensors.py --log ../logs/Giorno1/kalman_HE9.csv
-```
+### Grafico EKF (da `batch_ekf.py`)
 
----
-
-### ekf_sensor_fusion.py
-
-EKF che fonde:
-- **IMU/AHRS** (Xsens MTI-670): Roll, Pitch, Yaw, Acc, Gyro
-- **USBL** (Evologics): Coordinate X,Y dirette
-- **Profondimetro** (MS5837-30BA): Profondità
-
-```bash
-python ekf_sensor_fusion.py
-python ekf_sensor_fusion.py --no-csv-estimate
-```
-
-**Output:** `ekf_fusion_result.png`
+| File | Contenuto |
+|------|-----------|
+| `ekf_comparison.png` | **4 subplot**: mappa 2D, X vs tempo, Y vs tempo, Z vs tempo. Confronta EKF (nuovo) vs CSV estimate (originale) vs USBL fixes |
 
 ---
 
-## Configurazione
+## EKF
 
-Modifica `DEFAULT_LOG_PATH` in cima agli script per cambiare log di default:
-
-```python
-DEFAULT_LOG_PATH = "../logs/Giorno1/kalman_HE9.csv"
-```
+L'EKF usa update **USBL X,Y diretto** (non range-only):
+- **Stato**: `[x, y, z, vx, vy, vz]`
+- **Prediction**: IMU (acc, gyro, orientamento)
+- **Update USBL**: coordinate X,Y dirette → osservazione lineare
+- **Update Depth**: profondimetro
 
 ---
 
 ## Formato Log
 
-I file `kalman_*.csv` contengono 23 colonne. Vedi [KALMAN_LOG_COLUMNS.md](KALMAN_LOG_COLUMNS.md).
+File `kalman_*.csv` con 23 colonne. Vedi [KALMAN_LOG_COLUMNS.md](KALMAN_LOG_COLUMNS.md).
 
 ---
 
